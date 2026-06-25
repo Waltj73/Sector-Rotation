@@ -1,662 +1,407 @@
-# app.py — DK Golf: PGA Optimizer (Single Entry • Balanced Cash • Pro Mode)
-# ------------------------------------------------------------
-# Upload DK Salaries CSV + (optional) DataGolf performance CSV
-# Builds 1–3 lineups with constraints and optional "Spike lineup":
-#   Lineup #2: 2 studs (>= threshold) + 1 punt (< 7k)
-#
-# Fixes:
-# - Auto-detect player name columns (no manual renaming)
-# - Cleans NaN/inf to prevent PuLP objective crashes
-# - Avoids KeyError/indentation issues
-#
-# Requirements (put in requirements.txt):
-# streamlit
-# pandas
-# numpy
-# pulp
-# ------------------------------------------------------------
+"""
+Sector Rotation Momentum Dashboard
+-----------------------------------
+Tracks relative strength and momentum across the 11 S&P 500 sector ETFs
+(SPDR Select Sector Funds) vs SPY, to visualize which sectors are leading
+or lagging the market.
 
-from __future__ import annotations
+Run with:
+    streamlit run app.py
 
-import io
-import re
-import math
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+Dependencies:
+    pip install streamlit yfinance pandas numpy plotly
+"""
 
-import numpy as np
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import plotly.graph_objects as go
+import plotly.express as px
+from datetime import datetime, timedelta
 
-try:
-    from pulp import (
-        LpProblem,
-        LpMaximize,
-        LpVariable,
-        lpSum,
-        LpStatus,
-        PULP_CBC_CMD,
-        value,
+# -----------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------
+
+st.set_page_config(
+    page_title="Sector Rotation Dashboard",
+    page_icon="🔄",
+    layout="wide",
+)
+
+SECTOR_ETFS = {
+    "XLK": "Technology",
+    "XLF": "Financials",
+    "XLV": "Health Care",
+    "XLY": "Consumer Discretionary",
+    "XLP": "Consumer Staples",
+    "XLE": "Energy",
+    "XLI": "Industrials",
+    "XLB": "Materials",
+    "XLU": "Utilities",
+    "XLRE": "Real Estate",
+    "XLC": "Communication Services",
+}
+BENCHMARK = "SPY"
+
+LOOKBACKS = {
+    "1 Week": 5,
+    "1 Month": 21,
+    "3 Months": 63,
+    "6 Months": 126,
+    "1 Year": 252,
+}
+
+# -----------------------------------------------------------------------
+# Data loading
+# -----------------------------------------------------------------------
+
+@st.cache_data(ttl=60 * 30, show_spinner=False)
+def load_price_data(tickers, period="1y"):
+    """Download adjusted close prices for a list of tickers."""
+    raw = yf.download(
+        tickers,
+        period=period,
+        auto_adjust=True,
+        progress=False,
+        group_by="ticker",
+        threads=True,
     )
-except Exception:
-    st.error("PuLP is not installed. Add `pulp` to your requirements.txt and redeploy.")
+
+    closes = {}
+    if isinstance(raw.columns, pd.MultiIndex):
+        for t in tickers:
+            try:
+                closes[t] = raw[t]["Close"]
+            except KeyError:
+                continue
+    else:
+        # Single ticker case
+        closes[tickers[0]] = raw["Close"]
+
+    df = pd.DataFrame(closes).dropna(how="all")
+    df = df.ffill().dropna()
+    return df
+
+
+def compute_returns(prices: pd.DataFrame, days: int) -> pd.Series:
+    """% return over the trailing `days` trading days for each column."""
+    if len(prices) <= days:
+        days = len(prices) - 1
+    if days <= 0:
+        return pd.Series(0.0, index=prices.columns)
+    return (prices.iloc[-1] / prices.iloc[-1 - days] - 1.0) * 100
+
+
+def compute_relative_strength(prices: pd.DataFrame, benchmark: str) -> pd.DataFrame:
+    """Normalize each sector's price by the benchmark price (RS line)."""
+    rs = prices.div(prices[benchmark], axis=0)
+    rs = rs / rs.iloc[0] * 100  # index to 100 at start of window
+    return rs
+
+
+def momentum_score(prices: pd.DataFrame, days: int, smooth: int = 5) -> pd.Series:
+    """Rate of change of relative strength — used as the RRG-style 'momentum' axis."""
+    rs = compute_relative_strength(prices, BENCHMARK)
+    rs_smooth = rs.rolling(smooth, min_periods=1).mean()
+    if len(rs_smooth) <= days:
+        days = len(rs_smooth) - 1
+    if days <= 0:
+        return pd.Series(0.0, index=prices.columns)
+    momentum = (rs_smooth.iloc[-1] / rs_smooth.iloc[-1 - days] - 1.0) * 100
+    return momentum
+
+
+# -----------------------------------------------------------------------
+# Sidebar controls
+# -----------------------------------------------------------------------
+
+st.sidebar.title("🔄 Sector Rotation")
+st.sidebar.markdown("Settings")
+
+history_period = st.sidebar.selectbox(
+    "History to download",
+    options=["6mo", "1y", "2y", "5y"],
+    index=1,
+)
+
+rank_lookback_label = st.sidebar.selectbox(
+    "Rank sectors by",
+    options=list(LOOKBACKS.keys()),
+    index=2,  # 3 Months default
+)
+rank_lookback = LOOKBACKS[rank_lookback_label]
+
+quadrant_lookback_label = st.sidebar.selectbox(
+    "Rotation quadrant lookback (momentum)",
+    options=list(LOOKBACKS.keys()),
+    index=1,  # 1 Month default
+)
+quadrant_lookback = LOOKBACKS[quadrant_lookback_label]
+
+st.sidebar.markdown("---")
+if st.sidebar.button("🔁 Refresh data (clear cache)"):
+    st.cache_data.clear()
+    st.rerun()
+
+st.sidebar.caption(
+    f"Last loaded: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    "Data via Yahoo Finance (yfinance). Free-tier data may be delayed."
+)
+
+# -----------------------------------------------------------------------
+# Load data
+# -----------------------------------------------------------------------
+
+all_tickers = list(SECTOR_ETFS.keys()) + [BENCHMARK]
+
+with st.spinner("Downloading price data..."):
+    try:
+        prices = load_price_data(all_tickers, period=history_period)
+    except Exception as e:
+        st.error(f"Failed to download data: {e}")
+        st.stop()
+
+if prices.empty or BENCHMARK not in prices.columns:
+    st.error(
+        "No data returned. Check your internet connection or that the "
+        "tickers are valid. If you're behind a restrictive network/proxy, "
+        "yfinance may be blocked."
+    )
     st.stop()
 
+missing = [t for t in all_tickers if t not in prices.columns]
+if missing:
+    st.warning(f"Could not load data for: {', '.join(missing)}")
 
-# =========================
-# STREAMLIT CONFIG
-# =========================
-st.set_page_config(page_title="DK Golf — PGA Optimizer", layout="wide")
+available_sectors = {k: v for k, v in SECTOR_ETFS.items() if k in prices.columns}
 
-st.title("DK Golf — PGA Optimizer (Single Entry • Balanced Cash • Pro Mode)")
+# -----------------------------------------------------------------------
+# Header
+# -----------------------------------------------------------------------
 
+st.title("Sector Rotation Momentum Dashboard")
+st.caption(
+    "Relative strength and momentum across the 11 S&P 500 sectors, "
+    f"benchmarked against {BENCHMARK}. Not investment advice."
+)
 
-# =========================
-# HELPERS
-# =========================
-def _clean_cols(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    return df
+spy_last = prices[BENCHMARK].iloc[-1]
+spy_chg_1d = (prices[BENCHMARK].iloc[-1] / prices[BENCHMARK].iloc[-2] - 1) * 100 if len(prices) > 1 else 0
+c1, c2, c3 = st.columns(3)
+c1.metric("SPY (last close)", f"${spy_last:,.2f}", f"{spy_chg_1d:+.2f}%")
+c2.metric("Data range", f"{prices.index[0].date()} → {prices.index[-1].date()}")
+c3.metric("Sectors tracked", f"{len(available_sectors)} / 11")
 
+# -----------------------------------------------------------------------
+# Leaderboard table
+# -----------------------------------------------------------------------
 
-def detect_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    """
-    Return the first matching column name from candidates (case-insensitive),
-    or None if none found.
-    """
-    cols = list(df.columns)
-    lower_map = {c.lower(): c for c in cols}
-    # direct match
-    for cand in candidates:
-        if cand in cols:
-            return cand
-    # case-insensitive match
-    for cand in candidates:
-        key = cand.lower()
-        if key in lower_map:
-            return lower_map[key]
-    # fuzzy contains match
-    for c in cols:
-        cl = c.lower()
-        for cand in candidates:
-            if cand.lower() in cl:
-                return c
-    return None
+st.subheader("📊 Sector Leaderboard")
 
+rows = []
+for ticker, name in available_sectors.items():
+    row = {"Ticker": ticker, "Sector": name}
+    for label, days in LOOKBACKS.items():
+        row[label] = compute_returns(prices[[ticker]], days)[ticker]
+    rows.append(row)
 
-_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
+leaderboard = pd.DataFrame(rows)
+leaderboard = leaderboard.sort_values(rank_lookback_label, ascending=False).reset_index(drop=True)
+leaderboard.insert(0, "Rank", range(1, len(leaderboard) + 1))
 
+# Add SPY row for reference
+spy_row = {"Rank": "—", "Ticker": BENCHMARK, "Sector": "S&P 500 (Benchmark)"}
+for label, days in LOOKBACKS.items():
+    spy_row[label] = compute_returns(prices[[BENCHMARK]], days)[BENCHMARK]
+leaderboard_display = pd.concat([leaderboard, pd.DataFrame([spy_row])], ignore_index=True)
 
-def norm_name(x: str) -> str:
-    """
-    Normalize player name for joining across sources.
-    """
-    if x is None or (isinstance(x, float) and math.isnan(x)):
-        return ""
-    s = str(x).strip().lower()
+def style_returns(val):
+    if isinstance(val, (int, float)):
+        color = "#1a9850" if val > 0 else "#d73027" if val < 0 else "#888"
+        return f"color: {color}; font-weight: 600"
+    return ""
 
-    # Remove accents-ish (best-effort without extra deps)
-    s = (
-        s.replace("’", "'")
-        .replace("`", "'")
-        .replace("–", "-")
-        .replace("—", "-")
+styled = (
+    leaderboard_display.style
+    .format({label: "{:+.2f}%" for label in LOOKBACKS.keys()})
+    .applymap(style_returns, subset=list(LOOKBACKS.keys()))
+)
+st.dataframe(styled, use_container_width=True, hide_index=True)
+
+leading = leaderboard.iloc[0]
+lagging = leaderboard.iloc[-1]
+st.markdown(
+    f"**Leading sector ({rank_lookback_label}):** {leading['Sector']} ({leading['Ticker']}) "
+    f"at {leading[rank_lookback_label]:+.2f}% &nbsp;&nbsp;|&nbsp;&nbsp; "
+    f"**Lagging sector:** {lagging['Sector']} ({lagging['Ticker']}) "
+    f"at {lagging[rank_lookback_label]:+.2f}%"
+)
+
+# -----------------------------------------------------------------------
+# Bar chart of current ranking
+# -----------------------------------------------------------------------
+
+st.subheader(f"📈 Returns by Sector — {rank_lookback_label}")
+
+bar_df = leaderboard[["Sector", "Ticker", rank_lookback_label]].copy()
+bar_df = bar_df.sort_values(rank_lookback_label, ascending=True)
+bar_df["color"] = np.where(bar_df[rank_lookback_label] >= 0, "Positive", "Negative")
+
+fig_bar = px.bar(
+    bar_df,
+    x=rank_lookback_label,
+    y="Sector",
+    orientation="h",
+    color="color",
+    color_discrete_map={"Positive": "#1a9850", "Negative": "#d73027"},
+    text=bar_df[rank_lookback_label].map(lambda x: f"{x:+.2f}%"),
+    labels={rank_lookback_label: "Return (%)"},
+)
+fig_bar.update_traces(textposition="outside")
+fig_bar.update_layout(
+    showlegend=False,
+    height=450,
+    margin=dict(l=10, r=10, t=10, b=10),
+)
+st.plotly_chart(fig_bar, use_container_width=True)
+
+# -----------------------------------------------------------------------
+# Relative strength lines vs SPY
+# -----------------------------------------------------------------------
+
+st.subheader("📉 Relative Strength vs SPY")
+st.caption("Each line = sector price ÷ SPY price, indexed to 100 at the start of the window. Rising = outperforming SPY.")
+
+rs_window_label = st.select_slider(
+    "Chart window",
+    options=list(LOOKBACKS.keys()),
+    value="3 Months",
+)
+rs_days = LOOKBACKS[rs_window_label]
+rs_days = min(rs_days, len(prices) - 1)
+rs_prices = prices.iloc[-(rs_days + 1):]
+rs_lines = compute_relative_strength(rs_prices, BENCHMARK)
+
+selected_sectors = st.multiselect(
+    "Sectors to show",
+    options=list(available_sectors.keys()),
+    default=list(available_sectors.keys()),
+    format_func=lambda t: f"{t} — {available_sectors[t]}",
+)
+
+fig_rs = go.Figure()
+for ticker in selected_sectors:
+    fig_rs.add_trace(
+        go.Scatter(
+            x=rs_lines.index,
+            y=rs_lines[ticker],
+            mode="lines",
+            name=f"{ticker} ({available_sectors[ticker]})",
+        )
     )
+fig_rs.add_hline(y=100, line_dash="dash", line_color="gray", opacity=0.6)
+fig_rs.update_layout(
+    height=500,
+    yaxis_title="Relative Strength (indexed to 100)",
+    xaxis_title="Date",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    margin=dict(l=10, r=10, t=40, b=10),
+)
+st.plotly_chart(fig_rs, use_container_width=True)
 
-    # Remove punctuation except space
-    s = re.sub(r"[^a-z0-9\s]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
+# -----------------------------------------------------------------------
+# Rotation quadrant (RRG-style)
+# -----------------------------------------------------------------------
 
-    parts = s.split()
-    # drop suffix if last token is suffix
-    if parts and parts[-1] in _SUFFIXES:
-        parts = parts[:-1]
+st.subheader("🧭 Rotation Quadrant")
+st.caption(
+    "X-axis: relative strength vs SPY (RS level, indexed to 100 = in-line with market). "
+    "Y-axis: momentum (rate of change of relative strength). "
+    "Inspired by Relative Rotation Graphs (RRG) — not an official RRG implementation."
+)
 
-    return " ".join(parts)
+quad_days = min(max(LOOKBACKS.values()), len(prices) - 1)
+quad_prices = prices.iloc[-(quad_days + 1):]
+rs_full = compute_relative_strength(quad_prices, BENCHMARK)
+rs_current = rs_full.iloc[-1]
+mom_current = momentum_score(quad_prices, quadrant_lookback)
 
+quad_df = pd.DataFrame({
+    "Ticker": list(available_sectors.keys()),
+    "Sector": [available_sectors[t] for t in available_sectors.keys()],
+})
+quad_df["RS"] = quad_df["Ticker"].map(rs_current)
+quad_df["Momentum"] = quad_df["Ticker"].map(mom_current)
+quad_df = quad_df.dropna()
 
-def to_num(s: pd.Series) -> pd.Series:
-    return pd.to_numeric(s, errors="coerce")
+def quadrant_label(rs, mom):
+    if rs >= 100 and mom >= 0:
+        return "Leading"
+    elif rs >= 100 and mom < 0:
+        return "Weakening"
+    elif rs < 100 and mom < 0:
+        return "Lagging"
+    else:
+        return "Improving"
 
+quad_df["Quadrant"] = quad_df.apply(lambda r: quadrant_label(r["RS"], r["Momentum"]), axis=1)
 
-def safe_numeric(df: pd.DataFrame, cols: List[str], fill: float = 0.0) -> pd.DataFrame:
-    df = df.copy()
-    for c in cols:
-        if c in df.columns:
-            df[c] = to_num(df[c])
-            df[c] = df[c].replace([np.inf, -np.inf], np.nan).fillna(fill)
-    return df
+quad_colors = {
+    "Leading": "#1a9850",
+    "Weakening": "#fee08b",
+    "Lagging": "#d73027",
+    "Improving": "#4575b4",
+}
 
+fig_quad = px.scatter(
+    quad_df,
+    x="RS",
+    y="Momentum",
+    color="Quadrant",
+    color_discrete_map=quad_colors,
+    text="Ticker",
+    hover_data={"Sector": True, "RS": ":.2f", "Momentum": ":.2f", "Quadrant": True},
+)
+fig_quad.update_traces(textposition="top center", marker=dict(size=14, line=dict(width=1, color="white")))
+fig_quad.add_vline(x=100, line_dash="dash", line_color="gray", opacity=0.5)
+fig_quad.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
 
-def percentile_rank(series: pd.Series) -> pd.Series:
-    s = series.copy()
-    s = s.replace([np.inf, -np.inf], np.nan)
-    if s.notna().sum() <= 1:
-        return pd.Series([50.0] * len(s), index=s.index)
-    # 0..1 then 0..100
-    return s.rank(pct=True).fillna(0.5) * 100.0
+x_range = [quad_df["RS"].min() - 2, quad_df["RS"].max() + 2]
+y_range = [quad_df["Momentum"].min() - 1, quad_df["Momentum"].max() + 1]
+fig_quad.add_annotation(x=x_range[1], y=y_range[1], text="LEADING", showarrow=False, font=dict(color="#1a9850", size=12), xanchor="right", yanchor="top")
+fig_quad.add_annotation(x=x_range[0], y=y_range[1], text="IMPROVING", showarrow=False, font=dict(color="#4575b4", size=12), xanchor="left", yanchor="top")
+fig_quad.add_annotation(x=x_range[1], y=y_range[0], text="WEAKENING", showarrow=False, font=dict(color="#b8860b", size=12), xanchor="right", yanchor="bottom")
+fig_quad.add_annotation(x=x_range[0], y=y_range[0], text="LAGGING", showarrow=False, font=dict(color="#d73027", size=12), xanchor="left", yanchor="bottom")
 
+fig_quad.update_layout(
+    height=550,
+    xaxis_title="Relative Strength (100 = in-line with SPY)",
+    yaxis_title=f"Momentum ({quadrant_lookback_label} RS rate-of-change)",
+    margin=dict(l=10, r=10, t=10, b=10),
+)
+st.plotly_chart(fig_quad, use_container_width=True)
 
-@dataclass
-class BuildResult:
-    lineup: pd.DataFrame
-    total_salary: int
-    total_proj: float
-    status: str
-
-
-# =========================
-# SIDEBAR: WORKFLOW
-# =========================
-with st.expander("What to upload / workflow", expanded=False):
+with st.expander("How to read the quadrant"):
     st.markdown(
         """
-**You need:**
-1) **DraftKings Salaries CSV** (the DK export for the tournament slate)
-2) *(Optional but recommended)* **DataGolf Performance CSV** (your performance table export)
+- **Leading** (top-right): outperforming SPY and still gaining momentum.
+- **Weakening** (bottom-right): outperforming SPY but momentum is fading — often rotates into Lagging next.
+- **Lagging** (bottom-left): underperforming SPY and still losing momentum.
+- **Improving** (top-left): underperforming SPY but momentum is turning up — often rotates into Leading next.
 
-**Flow:**
-- Upload files
-- Tune (or leave defaults)
-- Generate 1–3 lineups
-- Download CSV
-
-**Pro tip**
-- Use **2 lineups**:
-  - Lineup 1 = balanced/safe
-  - Lineup 2 = spike (2 studs + 1 punt)
-"""
+Sectors tend to rotate clockwise through these quadrants over a full market cycle.
+        """
     )
 
+# -----------------------------------------------------------------------
+# Raw data (optional)
+# -----------------------------------------------------------------------
 
-# =========================
-# UPLOADS
-# =========================
-st.subheader("Upload Files")
+with st.expander("📋 Raw price data"):
+    st.dataframe(prices.tail(30).sort_index(ascending=False), use_container_width=True)
 
-colA, colB = st.columns(2)
-
-with colA:
-    dk_file = st.file_uploader("DraftKings Salaries CSV", type=["csv"])
-with colB:
-    dg_file = st.file_uploader("DataGolf Performance CSV (optional)", type=["csv"])
-
-if not dk_file:
-    st.info("Upload a DraftKings Salaries CSV to begin.")
-    st.stop()
-
-# Read DK
-dk = pd.read_csv(dk_file)
-dk = _clean_cols(dk)
-
-# Detect DK columns
-dk_name_col = detect_col(dk, ["Name", "Player", "Player Name", "Golfer", "player_name"])
-dk_salary_col = detect_col(dk, ["Salary", "salary"])
-dk_avg_col = detect_col(
-    dk,
-    [
-        "AvgPointsPerGame",
-        "DK AvgPointsPerGame",
-        "DKAvgPointsPerGame",
-        "AvgPoints",
-        "Avg DK Points",
-        "Avg DK",
-    ],
+st.caption(
+    "Data source: Yahoo Finance via yfinance. For informational purposes only — not financial advice."
 )
-
-# Validate required columns
-missing = []
-if not dk_name_col:
-    missing.append("Name")
-if not dk_salary_col:
-    missing.append("Salary")
-
-if missing:
-    st.error(
-        "Your DK CSV is missing required columns (or they weren't recognized).\n\n"
-        f"Missing: {', '.join(missing)}\n\n"
-        f"Found columns: {list(dk.columns)}"
-    )
-    st.stop()
-
-dk = dk.rename(columns={dk_name_col: "name", dk_salary_col: "salary"})
-dk["name_key"] = dk["name"].map(norm_name)
-dk["salary"] = to_num(dk["salary"]).fillna(0).astype(int)
-
-# If DK avg points exists, keep it; else create empty
-if dk_avg_col:
-    dk = dk.rename(columns={dk_avg_col: "dk_avg"})
-    dk["dk_avg"] = to_num(dk["dk_avg"]).replace([np.inf, -np.inf], np.nan)
-else:
-    dk["dk_avg"] = np.nan
-
-# Drop invalid names
-dk = dk[dk["name_key"].astype(bool)].copy()
-dk = dk.drop_duplicates(subset=["name_key"], keep="first").reset_index(drop=True)
-
-# =========================
-# OPTIONAL: READ DATAGOLF
-# =========================
-dg = None
-dg_merged = False
-if dg_file:
-    dg = pd.read_csv(dg_file)
-    dg = _clean_cols(dg)
-
-    dg_name_col = detect_col(dg, ["Player", "Name", "player_name", "Golfer"])
-    if not dg_name_col:
-        st.warning(
-            "DataGolf CSV uploaded, but no recognizable player name column was found. "
-            "We’ll run DK-only this week."
-        )
-        dg = None
-    else:
-        dg = dg.rename(columns={dg_name_col: "player_name"})
-        dg["name_key"] = dg["player_name"].map(norm_name)
-        dg = dg[dg["name_key"].astype(bool)].copy()
-
-        # Try to find useful DataGolf performance columns (best-effort)
-        # Common possibilities across exports
-        dg_total_sg_col = detect_col(
-            dg,
-            ["TOTAL", "SG: TOTAL", "Strokes Gained: Total", "True SG", "TRUE SG", "true_sg", "sg_total"],
-        )
-        dg_t2g_col = detect_col(dg, ["T2G", "SG: T2G", "sg_t2g", "tee_to_green"])
-        dg_app_col = detect_col(dg, ["APP", "Approach", "SG: APP", "sg_app", "sg_approach"])
-        dg_putt_col = detect_col(dg, ["PUTT", "Putting", "SG: PUTT", "sg_putt"])
-        dg_ott_col = detect_col(dg, ["OTT", "Off-the-tee", "Off the Tee", "SG: OTT", "sg_ott"])
-        dg_arg_col = detect_col(dg, ["ARG", "Around the Green", "SG: ARG", "sg_arg"])
-
-        # Keep a compact DG table for merge
-        keep = ["name_key"]
-        rename_map = {}
-        for col, new in [
-            (dg_total_sg_col, "dg_sg_total"),
-            (dg_t2g_col, "dg_sg_t2g"),
-            (dg_app_col, "dg_sg_app"),
-            (dg_putt_col, "dg_sg_putt"),
-            (dg_ott_col, "dg_sg_ott"),
-            (dg_arg_col, "dg_sg_arg"),
-        ]:
-            if col:
-                keep.append(col)
-                rename_map[col] = new
-
-        dg_small = dg[keep].rename(columns=rename_map).copy()
-
-        # numeric clean
-        dg_small = safe_numeric(
-            dg_small,
-            [c for c in dg_small.columns if c.startswith("dg_")],
-            fill=np.nan,
-        )
-
-        # Merge
-        merged = dk.merge(dg_small, on="name_key", how="left")
-        dg_merged = True
-else:
-    merged = dk.copy()
-
-# If DG not merged, merged already defined
-if not dg_merged:
-    merged = dk.copy()
-
-# =========================
-# PROJECTION BASELINE
-# =========================
-st.subheader("Projection Baseline (leave defaults unless you want to tune)")
-
-c1, c2, c3 = st.columns(3)
-with c1:
-    anchor_pts = st.slider("Salary anchor points (median salary golfer)", 10.0, 120.0, 55.0, 0.5)
-with c2:
-    slope_pts = st.slider("Salary slope (points per $1k)", 0.5, 10.0, 3.0, 0.1)
-with c3:
-    w_dk = st.slider("Weight on DK AvgPointsPerGame", 0.0, 1.0, 0.70, 0.05)
-
-# Create salary-based baseline projection
-median_salary = float(merged["salary"].median()) if len(merged) else 8000.0
-merged["base_salary_proj"] = anchor_pts + slope_pts * ((merged["salary"] - median_salary) / 1000.0)
-
-# Blend with DK avg if present
-# If dk_avg is missing, fallback to salary proj
-merged["base_proj"] = merged["base_salary_proj"]
-has_dk_avg = merged["dk_avg"].notna()
-merged.loc[has_dk_avg, "base_proj"] = (
-    (1.0 - w_dk) * merged.loc[has_dk_avg, "base_salary_proj"] + w_dk * merged.loc[has_dk_avg, "dk_avg"]
-)
-
-# =========================
-# CUT SAFETY + SE PROJ
-# =========================
-st.subheader("Single Entry Blend")
-
-cut_available = any(c.startswith("dg_") for c in merged.columns)
-
-cs_weight = st.slider("CutSafety weight (SE cash bias)", 0.0, 0.60, 0.25, 0.01)
-
-# Compute CutSafety from DataGolf if available; else neutral
-if cut_available:
-    # Prefer total SG; else T2G; else App; else neutral
-    cs_src = None
-    for col in ["dg_sg_total", "dg_sg_t2g", "dg_sg_app", "dg_sg_ott", "dg_sg_putt", "dg_sg_arg"]:
-        if col in merged.columns and merged[col].notna().sum() > 5:
-            cs_src = col
-            break
-
-    if cs_src:
-        merged["cut_safety"] = percentile_rank(merged[cs_src])
-    else:
-        merged["cut_safety"] = 50.0
-else:
-    merged["cut_safety"] = 50.0
-
-# SE projection = base_proj + (CutSafety z-ish bump)
-# Bump is small and centered so it doesn't dominate
-merged["cut_safety_adj"] = (merged["cut_safety"] - 50.0) / 50.0  # -1..+1
-merged["se_proj"] = merged["base_proj"] * (1.0 + cs_weight * merged["cut_safety_adj"])
-
-# Value metric
-merged["value_1k"] = merged["se_proj"] / (merged["salary"] / 1000.0)
-
-# Clean numerics to prevent NaN in PuLP objective
-merged = safe_numeric(
-    merged,
-    ["base_salary_proj", "base_proj", "cut_safety", "cut_safety_adj", "se_proj", "value_1k", "dk_avg"],
-    fill=0.0,
-)
-
-# Show top table
-st.markdown("### Top Players (by SE projection)")
-st.dataframe(
-    merged.sort_values("se_proj", ascending=False)[
-        ["name", "salary", "base_proj", "se_proj", "value_1k", "cut_safety"]
-    ].head(25),
-    use_container_width=True,
-)
-
-
-# =========================
-# LINEUP BUILDER SETTINGS
-# =========================
-st.subheader("Build Lineups (Balanced + Randomness + Overlap Control)")
-
-ROSTER_SIZE = 6
-SALARY_CAP = 50000
-
-b1, b2, b3, b4 = st.columns(4)
-with b1:
-    n_lineups = st.slider("Lineups", 1, 3, 2)
-with b2:
-    base_rand = st.slider("Randomness % (Lineup #1)", 0.0, 25.0, 6.0, 0.5)
-with b3:
-    spike_rand = st.slider("Randomness % (Lineup #2)", 0.0, 25.0, 12.0, 0.5)
-with b4:
-    seed = st.number_input("Random seed", min_value=0, max_value=999999, value=2026, step=1)
-
-# Balanced constraints
-cA, cB, cC, cD = st.columns(4)
-with cA:
-    min_total_salary = st.slider("Min total salary", 45000, 50000, 49300, 100)
-with cB:
-    min_avg_salary = st.slider("Min avg salary per golfer", 6500, 9500, 8000, 100)
-with cC:
-    max_under_7000_safe = st.slider("Lineup #1: max golfers under $7,000", 0, 3, 0, 1)
-with cD:
-    max_over_10500 = st.slider("Max golfers over $10,500", 0, 3, 1, 1)
-
-# C-mode spike construction (Lineup #2)
-st.markdown("### Spike Mode (Lineup #2 only)")
-s1, s2, s3 = st.columns(3)
-with s1:
-    force_spike = st.toggle("Lineup #2: Force 2 studs + 1 punt", value=True)
-with s2:
-    stud_threshold = st.number_input("Stud threshold ($)", min_value=9000, max_value=12000, value=10000, step=100)
-with s3:
-    punt_threshold = st.number_input("Punt threshold ($)", min_value=5000, max_value=8000, value=7000, step=100)
-
-# Guardrails
-st.markdown("### Guardrails")
-g1, g2, g3 = st.columns(3)
-with g1:
-    enable_guardrails = st.toggle("Enable CutSafety guardrails", value=True)
-with g2:
-    cs_min_floor = st.slider("CutSafety floor (Lineup #1 hard floor)", 0.0, 90.0, 60.0, 1.0)
-with g3:
-    cs_min_avg = st.slider("Min average CutSafety (both lineups)", 0.0, 90.0, 65.0, 1.0)
-
-# Overlap control
-max_overlap = st.slider("Max overlap between lineups (when building 2–3)", 0, 6, 4, 1)
-
-# Manual controls
-st.markdown("### Optional Manual Controls (fast pivots)")
-m1, m2, m3 = st.columns(3)
-with m1:
-    lock_names = st.multiselect("Lock golfers", options=sorted(merged["name"].unique().tolist()))
-with m2:
-    exclude_names = st.multiselect("Exclude golfers", options=sorted(merged["name"].unique().tolist()))
-with m3:
-    bump_names = st.multiselect("Bump golfers (small +%)", options=sorted(merged["name"].unique().tolist()))
-
-bump_pct = st.slider("Bump % (applied to 'Bump golfers')", 0.0, 20.0, 5.0, 0.5)
-
-# Build button
-build = st.button("Generate Lineups", type="primary")
-
-
-# =========================
-# OPTIMIZER
-# =========================
-def build_lineup(
-    pool: pd.DataFrame,
-    objective_col: str,
-    min_total_salary_i: int,
-    max_under_7000: int,
-    force_spike_mode: bool,
-    stud_threshold_i: int,
-    punt_threshold_i: int,
-    lineup_index: int,
-    prev_lineups: List[set],
-) -> BuildResult:
-    """
-    Build one lineup using PuLP.
-    """
-    pool = pool.copy().reset_index(drop=True)
-
-    # Variables
-    x = [LpVariable(f"x_{lineup_index}_{i}", cat="Binary") for i in range(len(pool))]
-
-    prob = LpProblem(f"DK_Golf_LU_{lineup_index+1}", LpMaximize)
-
-    # Objective
-    obj_vals = pool[objective_col].astype(float).values
-    # Final safety: ensure objective values are finite
-    obj_vals = np.nan_to_num(obj_vals, nan=0.0, posinf=0.0, neginf=0.0)
-    prob += lpSum(obj_vals[i] * x[i] for i in range(len(pool)))
-
-    # Roster size
-    prob += lpSum(x) == ROSTER_SIZE
-
-    # Salary constraints
-    salaries = pool["salary"].astype(int).values
-    prob += lpSum(int(salaries[i]) * x[i] for i in range(len(pool))) <= SALARY_CAP
-    prob += lpSum(int(salaries[i]) * x[i] for i in range(len(pool))) >= int(min_total_salary_i)
-
-    # Min avg salary per golfer
-    prob += lpSum(int(salaries[i]) * x[i] for i in range(len(pool))) >= int(min_avg_salary) * ROSTER_SIZE
-
-    # Max over 10.5k
-    prob += lpSum(x[i] for i in range(len(pool)) if int(salaries[i]) > 10500) <= int(max_over_10500)
-
-    # Under 7k (safe lineup rule)
-    prob += lpSum(x[i] for i in range(len(pool)) if int(salaries[i]) < int(punt_threshold_i)) <= int(max_under_7000)
-
-    # Spike mode construction for lineup #2 (index 1)
-    if lineup_index == 1 and force_spike_mode:
-        # exactly 1 punt
-        prob += lpSum(x[i] for i in range(len(pool)) if int(salaries[i]) < int(punt_threshold_i)) == 1
-        # exactly 2 studs
-        prob += lpSum(x[i] for i in range(len(pool)) if int(salaries[i]) >= int(stud_threshold_i)) == 2
-
-    # Guardrails based on cut_safety
-    if enable_guardrails:
-        cs = pool["cut_safety"].astype(float).values
-        cs = np.nan_to_num(cs, nan=50.0, posinf=50.0, neginf=50.0)
-
-        # Hard floor for lineup #1 only (and for lineup #2 only if spike not forced)
-        if not (lineup_index == 1 and force_spike_mode):
-            prob += lpSum(x[i] for i in range(len(pool)) if float(cs[i]) < float(cs_min_floor)) == 0
-
-        # Min average cut safety always
-        prob += lpSum(float(cs[i]) * x[i] for i in range(len(pool))) >= float(cs_min_avg) * ROSTER_SIZE
-
-    # Locks / excludes by name
-    name_list = pool["name"].astype(str).tolist()
-    name_to_idx = {}
-    for i, nm in enumerate(name_list):
-        name_to_idx.setdefault(nm, []).append(i)
-
-    for nm in lock_names:
-        if nm in name_to_idx:
-            prob += lpSum(x[i] for i in name_to_idx[nm]) == 1
-
-    for nm in exclude_names:
-        if nm in name_to_idx:
-            prob += lpSum(x[i] for i in name_to_idx[nm]) == 0
-
-    # Overlap control with previous lineups
-    # Each new lineup cannot share more than max_overlap with any previous lineup
-    if prev_lineups:
-        for j, prev in enumerate(prev_lineups):
-            prev_idx = [i for i, nm in enumerate(name_list) if nm in prev]
-            if prev_idx:
-                prob += lpSum(x[i] for i in prev_idx) <= int(max_overlap)
-
-    # Solve
-    solver = PULP_CBC_CMD(msg=False)
-    prob.solve(solver)
-
-    status = LpStatus.get(prob.status, str(prob.status))
-    if status != "Optimal":
-        return BuildResult(
-            lineup=pd.DataFrame(),
-            total_salary=0,
-            total_proj=0.0,
-            status=status,
-        )
-
-    chosen = [i for i in range(len(pool)) if x[i].value() == 1]
-    lu = pool.loc[chosen, ["name", "salary", "base_proj", "se_proj", "cut_safety"]].copy()
-
-    # Total salary / proj
-    tot_sal = int(lu["salary"].sum())
-    tot_proj = float(lu["se_proj"].sum())
-
-    # Sort display: high salary first
-    lu = lu.sort_values("salary", ascending=False).reset_index(drop=True)
-
-    return BuildResult(lineup=lu, total_salary=tot_sal, total_proj=tot_proj, status=status)
-
-
-# =========================
-# RUN BUILD
-# =========================
-if build:
-    pool = merged.copy()
-
-    # Apply bumps before randomness (small deterministic tweak)
-    pool["bump_pct"] = 0.0
-    if bump_names:
-        pool.loc[pool["name"].isin(bump_names), "bump_pct"] = float(bump_pct)
-
-    pool["final_base"] = pool["se_proj"] * (1.0 + pool["bump_pct"] / 100.0)
-
-    # Ensure numeric cleanliness to prevent PuLP NaN/inf errors
-    pool = safe_numeric(pool, ["final_base", "se_proj", "base_proj", "cut_safety"], fill=0.0)
-
-    rng = np.random.default_rng(int(seed))
-
-    results: List[BuildResult] = []
-    prev_lineups: List[set] = []
-
-    for k in range(int(n_lineups)):
-        this_rand = float(base_rand) if k == 0 else float(spike_rand)
-
-        noise = rng.normal(0.0, 1.0, size=len(pool))
-        obj = pool["final_base"].astype(float).values * (1.0 + (this_rand / 100.0) * noise)
-
-        # Keep objective finite
-        obj = np.nan_to_num(obj, nan=0.0, posinf=0.0, neginf=0.0)
-
-        obj_col = f"obj_{k}"
-        pool[obj_col] = obj
-
-        # For lineup #1, enforce "max_under_7000_safe"
-        # For lineup #2 spike mode, we'll allow under 7k (and possibly force it)
-        max_under = int(max_under_7000_safe) if k == 0 else 6
-
-        res = build_lineup(
-            pool=pool,
-            objective_col=obj_col,
-            min_total_salary_i=int(min_total_salary),
-            max_under_7000=max_under,
-            force_spike_mode=bool(force_spike),
-            stud_threshold_i=int(stud_threshold),
-            punt_threshold_i=int(punt_threshold),
-            lineup_index=k,
-            prev_lineups=prev_lineups,
-        )
-
-        results.append(res)
-
-        if not res.lineup.empty:
-            prev_lineups.append(set(res.lineup["name"].tolist()))
-
-    # Display
-    st.markdown("---")
-    st.subheader("Results")
-
-    any_ok = False
-    out_csv_rows = []
-
-    for i, res in enumerate(results):
-        st.markdown(f"### Lineup {i+1}")
-
-        if res.status != "Optimal":
-            st.error(f"Optimizer status: **{res.status}**. Try loosening constraints (min salary / overlap / locks).")
-            continue
-
-        any_ok = True
-        a, b, c = st.columns(3)
-        a.metric("Salary Used", f"${res.total_salary:,}")
-        b.metric("Projected (SE)", f"{res.total_proj:.2f}")
-        c.metric("Salary Left", f"${SALARY_CAP - res.total_salary:,}")
-
-        st.dataframe(res.lineup, use_container_width=True)
-
-        # Prepare export rows
-        for _, row in res.lineup.iterrows():
-            out_csv_rows.append(
-                {
-                    "lineup": i + 1,
-                    "name": row["name"],
-                    "salary": int(row["salary"]),
-                    "base_proj": float(row["base_proj"]),
-                    "se_proj": float(row["se_proj"]),
-                    "cut_safety": float(row["cut_safety"]),
-                }
-            )
-
-    if any_ok and out_csv_rows:
-        out_df = pd.DataFrame(out_csv_rows)
-        csv_bytes = out_df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download Lineups CSV",
-            data=csv_bytes,
-            file_name="dk_golf_lineups.csv",
-            mime="text/csv",
-        )
-
-    st.markdown("---")
-    st.caption("Tip: If you keep seeing 'not optimal', reduce overlap, lower min salary, or remove locks.")
