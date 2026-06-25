@@ -378,6 +378,98 @@ if len(extra_rows) > 0:
     st.caption(f"Sub-industries (not ranked against sectors above): {extra_bits}")
 
 # -----------------------------------------------------------------------
+# Plain-English rotation summary
+# -----------------------------------------------------------------------
+
+st.subheader("📝 What's the money doing?")
+
+summary_window_label = st.selectbox(
+    "Summarize over",
+    options=list(LOOKBACKS.keys()),
+    index=2,  # 3 Months default
+    key="summary_window",
+)
+summary_days = LOOKBACKS[summary_window_label]
+
+# Thresholds for calling a sector "unchanged" vs a real mover. Scaled loosely by
+# window length so "flat" means something different over 1 week vs 1 year.
+flat_threshold = max(1.0, 0.6 * (summary_days / 21))  # ~1% for short windows, scales up for longer ones
+
+# Acceleration for the write-up is tied to the window the user picked here, not the
+# sidebar's accel windows — otherwise the "still picking up pace" commentary could
+# describe a different timeframe than the one being summarized.
+_longer_windows = [d for d in LOOKBACKS.values() if d > summary_days]
+summary_long_days = min(_longer_windows) if _longer_windows else summary_days * 3
+summary_accel_df = compute_acceleration(prices, summary_days, summary_long_days)
+
+summary_rows = []
+for ticker, name in list(available_sectors.items()) + list(available_extras.items()):
+    ret = compute_returns(prices[[ticker]], summary_days)[ticker]
+    accel = summary_accel_df.loc[ticker, "accel_norm"] if ticker in summary_accel_df.index else 0.0
+    is_extra = ticker in available_extras
+    summary_rows.append({"Ticker": ticker, "Name": name, "Return": ret, "Accel": accel, "IsExtra": is_extra})
+
+summary_df = pd.DataFrame(summary_rows)
+
+inflow = summary_df[(summary_df["Return"] > flat_threshold)].sort_values("Return", ascending=False)
+outflow = summary_df[(summary_df["Return"] < -flat_threshold)].sort_values("Return", ascending=True)
+unchanged = summary_df[(summary_df["Return"].abs() <= flat_threshold)].sort_values("Return", ascending=False)
+
+def _fmt_list(df: pd.DataFrame) -> str:
+    parts = []
+    for _, r in df.iterrows():
+        tag = " (sub-industry)" if r["IsExtra"] else ""
+        parts.append(f"**{r['Name'].split(' (')[0]}** ({r['Ticker']}{tag}, {r['Return']:+.1f}%)")
+    if len(parts) == 0:
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+    return ", ".join(parts[:-1]) + (", and " if len(parts) > 2 else " and ") + parts[-1]
+
+summary_lines = []
+
+if not inflow.empty:
+    accelerating_in = inflow[inflow["Accel"] >= 20]
+    line = f"Over the last **{summary_window_label.lower()}**, money has been moving into "
+    line += _fmt_list(inflow) + "."
+    summary_lines.append(line)
+    if not accelerating_in.empty:
+        summary_lines.append(
+            f"Of those, {_fmt_list(accelerating_in)} {'is' if len(accelerating_in)==1 else 'are'} "
+            f"still picking up pace — the move looks like it's accelerating, not just coasting."
+        )
+
+if not outflow.empty:
+    line = f"Money has been leaving " + _fmt_list(outflow) + "."
+    summary_lines.append(line)
+    worsening = outflow[outflow["Accel"] < -20]
+    if not worsening.empty:
+        summary_lines.append(
+            f"{_fmt_list(worsening)} {'is' if len(worsening)==1 else 'are'} decelerating on top of "
+            f"already being negative, meaning the outflow itself looks like it's speeding up, not bottoming."
+        )
+
+if not unchanged.empty:
+    if not inflow.empty or not outflow.empty:
+        line = "Meanwhile, "
+    else:
+        line = f"Over the last **{summary_window_label.lower()}**, "
+    line += _fmt_list(unchanged)
+    line += f" {'has' if len(unchanged)==1 else 'have'} been roughly flat — no clear rotation in or out."
+    summary_lines.append(line)
+
+if summary_lines:
+    st.markdown(" ".join(summary_lines))
+else:
+    st.markdown("No sectors moved enough to call a clear rotation over this window.")
+
+st.caption(
+    f"\"Flat\" here means a return within ±{flat_threshold:.1f}% over {summary_window_label.lower()}. "
+    "This summary describes what already happened in the price data — it isn't a prediction or a "
+    "recommendation to buy or sell anything."
+)
+
+# -----------------------------------------------------------------------
 # Acceleration gauges (money in/out)
 # -----------------------------------------------------------------------
 
