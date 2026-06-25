@@ -254,11 +254,12 @@ def style_returns(val):
         return f"color: {color}; font-weight: 600"
     return ""
 
-styled = (
-    leaderboard_display.style
-    .format({label: "{:+.2f}%" for label in LOOKBACKS.keys()})
-    .applymap(style_returns, subset=list(LOOKBACKS.keys()))
-)
+styler = leaderboard_display.style.format({label: "{:+.2f}%" for label in LOOKBACKS.keys()})
+# pandas >= 2.1 renamed Styler.applymap -> Styler.map; pandas 3.x removed applymap entirely.
+if hasattr(styler, "map"):
+    styled = styler.map(style_returns, subset=list(LOOKBACKS.keys()))
+else:
+    styled = styler.applymap(style_returns, subset=list(LOOKBACKS.keys()))
 st.dataframe(styled, use_container_width=True, hide_index=True)
 
 leading = leaderboard.iloc[0]
