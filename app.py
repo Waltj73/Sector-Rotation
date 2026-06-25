@@ -18,6 +18,7 @@ import numpy as np
 import yfinance as yf
 import plotly.graph_objects as go
 import plotly.express as px
+from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 
 # -----------------------------------------------------------------------
@@ -121,6 +122,43 @@ def momentum_score(prices: pd.DataFrame, days: int, smooth: int = 5) -> pd.Serie
     return momentum
 
 
+def compute_acceleration(prices: pd.DataFrame, short_days: int, long_days: int) -> pd.DataFrame:
+    """
+    Compares the recent (short_days) return pace to the longer-term (long_days) return pace,
+    both normalized to a 'per short_days window' basis, so they're directly comparable.
+
+    Positive = the move is speeding up relative to its own longer-term trend (accelerating).
+    Negative = the move is slowing down relative to its own longer-term trend (decelerating) —
+    this applies whether the underlying return is positive (gains losing steam) or negative
+    (losses getting worse, i.e. accelerating to the downside).
+
+    Returns a DataFrame with columns: short_return, long_return, long_pace, accel_raw, accel_norm
+    accel_norm is squashed to roughly [-100, 100] via tanh scaling for gauge display.
+    """
+    if long_days <= short_days:
+        # Guard against misconfiguration (e.g. UI state where long window <= short window) —
+        # fall back to treating the long window as at least 2x the short window.
+        long_days = short_days * 2
+
+    short_ret = compute_returns(prices, short_days)
+    long_ret = compute_returns(prices, long_days)
+    # Pace of the long window, rescaled to the same time basis as the short window
+    long_pace = long_ret * (short_days / long_days)
+    accel_raw = short_ret - long_pace
+
+    # Squash to a stable gauge range. Scale chosen so a ~10pp pace gap reads as a strong
+    # (but not pegged) reading; tanh keeps extreme outliers from clipping the gauge silently.
+    accel_norm = np.tanh(accel_raw / 10.0) * 100
+
+    return pd.DataFrame({
+        "short_return": short_ret,
+        "long_return": long_ret,
+        "long_pace": long_pace,
+        "accel_raw": accel_raw,
+        "accel_norm": accel_norm,
+    })
+
+
 # -----------------------------------------------------------------------
 # Sidebar controls
 # -----------------------------------------------------------------------
@@ -147,6 +185,23 @@ quadrant_lookback_label = st.sidebar.selectbox(
     index=1,  # 1 Month default
 )
 quadrant_lookback = LOOKBACKS[quadrant_lookback_label]
+
+accel_short_label = st.sidebar.selectbox(
+    "Acceleration: short window",
+    options=list(LOOKBACKS.keys()),
+    index=1,  # 1 Month default
+    help="Recent pace. Compared against the long window below to detect speeding up / slowing down.",
+)
+accel_short = LOOKBACKS[accel_short_label]
+
+_long_options = [l for l in LOOKBACKS.keys() if LOOKBACKS[l] > accel_short]
+accel_long_label = st.sidebar.selectbox(
+    "Acceleration: long window",
+    options=_long_options if _long_options else list(LOOKBACKS.keys()),
+    index=0,  # first available window longer than the short window (3 Months by default)
+    help="Baseline trend pace. Short window's pace is compared against this one.",
+)
+accel_long = LOOKBACKS[accel_long_label]
 
 include_extras = st.sidebar.multiselect(
     "Sub-industries to include",
@@ -213,6 +268,37 @@ c2.metric("Data range", f"{prices.index[0].date()} → {prices.index[-1].date()}
 c3.metric("Sectors tracked", f"{len(available_sectors)} / 11")
 
 # -----------------------------------------------------------------------
+# Acceleration (money in/out): short-window pace vs long-window pace
+# -----------------------------------------------------------------------
+
+accel_df = compute_acceleration(prices, accel_short, accel_long)
+
+def accel_glyph(norm_val: float) -> str:
+    """Arrow glyph for a normalized acceleration score in roughly [-100, 100]."""
+    if norm_val >= 60:
+        return "⬆️⬆️"
+    elif norm_val >= 20:
+        return "⬆️"
+    elif norm_val > -20:
+        return "➡️"
+    elif norm_val > -60:
+        return "⬇️"
+    else:
+        return "⬇️⬇️"
+
+def accel_label(norm_val: float) -> str:
+    if norm_val >= 60:
+        return "Strongly accelerating"
+    elif norm_val >= 20:
+        return "Accelerating"
+    elif norm_val > -20:
+        return "Steady"
+    elif norm_val > -60:
+        return "Decelerating"
+    else:
+        return "Strongly decelerating"
+
+# -----------------------------------------------------------------------
 # Leaderboard table
 # -----------------------------------------------------------------------
 
@@ -223,6 +309,8 @@ for ticker, name in available_sectors.items():
     row = {"Ticker": ticker, "Sector": name, "Type": "Sector"}
     for label, days in LOOKBACKS.items():
         row[label] = compute_returns(prices[[ticker]], days)[ticker]
+    row["Accel"] = accel_glyph(accel_df.loc[ticker, "accel_norm"])
+    row["Accel Score"] = accel_df.loc[ticker, "accel_norm"]
     rows.append(row)
 
 leaderboard = pd.DataFrame(rows)
@@ -236,12 +324,16 @@ for ticker, name in available_extras.items():
     row = {"Rank": "—", "Ticker": ticker, "Sector": name, "Type": "Sub-Industry"}
     for label, days in LOOKBACKS.items():
         row[label] = compute_returns(prices[[ticker]], days)[ticker]
+    row["Accel"] = accel_glyph(accel_df.loc[ticker, "accel_norm"])
+    row["Accel Score"] = accel_df.loc[ticker, "accel_norm"]
     extra_rows.append(row)
 
 # Add SPY row for reference
 spy_row = {"Rank": "—", "Ticker": BENCHMARK, "Sector": "S&P 500 (Benchmark)", "Type": "Benchmark"}
 for label, days in LOOKBACKS.items():
     spy_row[label] = compute_returns(prices[[BENCHMARK]], days)[BENCHMARK]
+spy_row["Accel"] = accel_glyph(accel_df.loc[BENCHMARK, "accel_norm"])
+spy_row["Accel Score"] = accel_df.loc[BENCHMARK, "accel_norm"]
 
 leaderboard_display = pd.concat(
     [leaderboard, pd.DataFrame(extra_rows), pd.DataFrame([spy_row])],
@@ -254,13 +346,20 @@ def style_returns(val):
         return f"color: {color}; font-weight: 600"
     return ""
 
-styler = leaderboard_display.style.format({label: "{:+.2f}%" for label in LOOKBACKS.keys()})
+fmt_dict = {label: "{:+.2f}%" for label in LOOKBACKS.keys()}
+fmt_dict["Accel Score"] = "{:+.0f}"
+styler = leaderboard_display.style.format(fmt_dict)
 # pandas >= 2.1 renamed Styler.applymap -> Styler.map; pandas 3.x removed applymap entirely.
 if hasattr(styler, "map"):
-    styled = styler.map(style_returns, subset=list(LOOKBACKS.keys()))
+    styled = styler.map(style_returns, subset=list(LOOKBACKS.keys()) + ["Accel Score"])
 else:
-    styled = styler.applymap(style_returns, subset=list(LOOKBACKS.keys()))
+    styled = styler.applymap(style_returns, subset=list(LOOKBACKS.keys()) + ["Accel Score"])
 st.dataframe(styled, use_container_width=True, hide_index=True)
+st.caption(
+    f"Accel = pace of the last {accel_short_label.lower()} vs. the trend pace implied by the last "
+    f"{accel_long_label.lower()}. ⬆️⬆️/⬆️ = speeding up (whether gaining or, for negative returns, "
+    f"losing ground faster). ⬇️/⬇️⬇️ = slowing down (cooling off, or losses easing)."
+)
 
 leading = leaderboard.iloc[0]
 lagging = leaderboard.iloc[-1]
@@ -277,6 +376,78 @@ if len(extra_rows) > 0:
         for r in extra_rows
     )
     st.caption(f"Sub-industries (not ranked against sectors above): {extra_bits}")
+
+# -----------------------------------------------------------------------
+# Acceleration gauges (money in/out)
+# -----------------------------------------------------------------------
+
+st.subheader("🌡️ Acceleration Gauges — Money In / Out")
+st.caption(
+    f"Each gauge compares the last **{accel_short_label.lower()}**'s pace of return to the trend "
+    f"pace implied by the last **{accel_long_label.lower()}**. Right of center = accelerating "
+    "(money flowing in faster, or for a sector already falling, flowing out faster). "
+    "Left of center = decelerating (cooling off, or losses easing). The needle position is the "
+    "score; it does NOT mean the sector's return is positive or negative — check the leaderboard "
+    "for that."
+)
+
+gauge_universe = list(available_sectors.items()) + list(available_extras.items())
+n_gauges = len(gauge_universe)
+n_cols = 4 if n_gauges >= 4 else max(n_gauges, 1)
+n_rows = -(-n_gauges // n_cols)  # ceiling division
+
+# Sort so strongest accelerators and decelerators are easy to scan first
+gauge_universe_sorted = sorted(
+    gauge_universe,
+    key=lambda kv: accel_df.loc[kv[0], "accel_norm"],
+    reverse=True,
+)
+
+fig_gauges = make_subplots(
+    rows=n_rows,
+    cols=n_cols,
+    specs=[[{"type": "indicator"} for _ in range(n_cols)] for _ in range(n_rows)],
+    horizontal_spacing=0.05,
+    vertical_spacing=0.18 if n_rows > 1 else 0.05,
+)
+
+GAUGE_STEPS = [
+    {"range": [-100, -60], "color": "#d73027"},
+    {"range": [-60, -20], "color": "#fc9272"},
+    {"range": [-20, 20], "color": "#e0e0e0"},
+    {"range": [20, 60], "color": "#a6d96a"},
+    {"range": [60, 100], "color": "#1a9850"},
+]
+
+for i, (ticker, name) in enumerate(gauge_universe_sorted):
+    r = i // n_cols + 1
+    c = i % n_cols + 1
+    score = accel_df.loc[ticker, "accel_norm"]
+    needle_color = "#1a9850" if score > 20 else "#d73027" if score < -20 else "#888"
+    fig_gauges.add_trace(
+        go.Indicator(
+            mode="gauge+number",
+            value=float(score),
+            number={"suffix": "", "font": {"size": 18, "color": needle_color}},
+            title={"text": f"{ticker}<br><span style='font-size:11px;color:gray'>{accel_label(score)}</span>", "font": {"size": 13}},
+            gauge={
+                "axis": {"range": [-100, 100], "tickvals": [-100, 0, 100], "ticktext": ["Out", "", "In"], "tickfont": {"size": 9}},
+                "bar": {"color": needle_color, "thickness": 0.35},
+                "steps": GAUGE_STEPS,
+                "threshold": {"line": {"color": "black", "width": 2}, "thickness": 0.8, "value": float(score)},
+            },
+            domain={"row": r - 1, "column": c - 1},
+        ),
+        row=r,
+        col=c,
+    )
+
+fig_gauges.update_layout(
+    height=220 * n_rows,
+    margin=dict(l=20, r=20, t=40, b=20),
+    grid={"rows": n_rows, "columns": n_cols, "pattern": "independent"},
+)
+st.plotly_chart(fig_gauges, use_container_width=True)
 
 # -----------------------------------------------------------------------
 # Bar chart of current ranking
