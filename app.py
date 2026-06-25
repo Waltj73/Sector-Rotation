@@ -43,6 +43,14 @@ SECTOR_ETFS = {
     "XLRE": "Real Estate",
     "XLC": "Communication Services",
 }
+
+# Sub-industry ETFs tracked alongside (not part of) the 11 GICS sectors above.
+# XBI sits inside XLV (Health Care) but is volatile enough to be worth watching
+# on its own — equal-weighted, skews small/mid-cap biotech.
+EXTRA_INDUSTRIES = {
+    "XBI": "Biotech (sub-industry of Health Care)",
+}
+
 BENCHMARK = "SPY"
 
 LOOKBACKS = {
@@ -140,6 +148,15 @@ quadrant_lookback_label = st.sidebar.selectbox(
 )
 quadrant_lookback = LOOKBACKS[quadrant_lookback_label]
 
+include_extras = st.sidebar.multiselect(
+    "Sub-industries to include",
+    options=list(EXTRA_INDUSTRIES.keys()),
+    default=list(EXTRA_INDUSTRIES.keys()),
+    format_func=lambda t: f"{t} — {EXTRA_INDUSTRIES[t]}",
+    help="These overlap with one of the 11 sectors above (e.g. XBI is part of XLV) "
+         "but are shown separately since they can move very differently.",
+)
+
 st.sidebar.markdown("---")
 if st.sidebar.button("🔁 Refresh data (clear cache)"):
     st.cache_data.clear()
@@ -154,7 +171,7 @@ st.sidebar.caption(
 # Load data
 # -----------------------------------------------------------------------
 
-all_tickers = list(SECTOR_ETFS.keys()) + [BENCHMARK]
+all_tickers = list(SECTOR_ETFS.keys()) + list(include_extras) + [BENCHMARK]
 
 with st.spinner("Downloading price data..."):
     try:
@@ -176,6 +193,7 @@ if missing:
     st.warning(f"Could not load data for: {', '.join(missing)}")
 
 available_sectors = {k: v for k, v in SECTOR_ETFS.items() if k in prices.columns}
+available_extras = {k: v for k, v in EXTRA_INDUSTRIES.items() if k in prices.columns and k in include_extras}
 
 # -----------------------------------------------------------------------
 # Header
@@ -202,7 +220,7 @@ st.subheader("📊 Sector Leaderboard")
 
 rows = []
 for ticker, name in available_sectors.items():
-    row = {"Ticker": ticker, "Sector": name}
+    row = {"Ticker": ticker, "Sector": name, "Type": "Sector"}
     for label, days in LOOKBACKS.items():
         row[label] = compute_returns(prices[[ticker]], days)[ticker]
     rows.append(row)
@@ -211,11 +229,24 @@ leaderboard = pd.DataFrame(rows)
 leaderboard = leaderboard.sort_values(rank_lookback_label, ascending=False).reset_index(drop=True)
 leaderboard.insert(0, "Rank", range(1, len(leaderboard) + 1))
 
+# Extra sub-industry rows (e.g. XBI) — ranked among themselves, not mixed into
+# the 11-sector rank numbers above, since they're not a GICS sector.
+extra_rows = []
+for ticker, name in available_extras.items():
+    row = {"Rank": "—", "Ticker": ticker, "Sector": name, "Type": "Sub-Industry"}
+    for label, days in LOOKBACKS.items():
+        row[label] = compute_returns(prices[[ticker]], days)[ticker]
+    extra_rows.append(row)
+
 # Add SPY row for reference
-spy_row = {"Rank": "—", "Ticker": BENCHMARK, "Sector": "S&P 500 (Benchmark)"}
+spy_row = {"Rank": "—", "Ticker": BENCHMARK, "Sector": "S&P 500 (Benchmark)", "Type": "Benchmark"}
 for label, days in LOOKBACKS.items():
     spy_row[label] = compute_returns(prices[[BENCHMARK]], days)[BENCHMARK]
-leaderboard_display = pd.concat([leaderboard, pd.DataFrame([spy_row])], ignore_index=True)
+
+leaderboard_display = pd.concat(
+    [leaderboard, pd.DataFrame(extra_rows), pd.DataFrame([spy_row])],
+    ignore_index=True,
+)
 
 def style_returns(val):
     if isinstance(val, (int, float)):
@@ -239,6 +270,13 @@ st.markdown(
     f"at {lagging[rank_lookback_label]:+.2f}%"
 )
 
+if len(extra_rows) > 0:
+    extra_bits = " &nbsp;&nbsp;|&nbsp;&nbsp; ".join(
+        f"**{r['Sector'].split(' (')[0]} ({r['Ticker']}):** {r[rank_lookback_label]:+.2f}%"
+        for r in extra_rows
+    )
+    st.caption(f"Sub-industries (not ranked against sectors above): {extra_bits}")
+
 # -----------------------------------------------------------------------
 # Bar chart of current ranking
 # -----------------------------------------------------------------------
@@ -246,16 +284,24 @@ st.markdown(
 st.subheader(f"📈 Returns by Sector — {rank_lookback_label}")
 
 bar_df = leaderboard[["Sector", "Ticker", rank_lookback_label]].copy()
+bar_df["category"] = np.where(bar_df[rank_lookback_label] >= 0, "Positive", "Negative")
+
+if available_extras:
+    extra_bar_rows = []
+    for ticker, name in available_extras.items():
+        ret = compute_returns(prices[[ticker]], rank_lookback)[ticker]
+        extra_bar_rows.append({"Sector": name, "Ticker": ticker, rank_lookback_label: ret, "category": "Sub-Industry"})
+    bar_df = pd.concat([bar_df, pd.DataFrame(extra_bar_rows)], ignore_index=True)
+
 bar_df = bar_df.sort_values(rank_lookback_label, ascending=True)
-bar_df["color"] = np.where(bar_df[rank_lookback_label] >= 0, "Positive", "Negative")
 
 fig_bar = px.bar(
     bar_df,
     x=rank_lookback_label,
     y="Sector",
     orientation="h",
-    color="color",
-    color_discrete_map={"Positive": "#1a9850", "Negative": "#d73027"},
+    color="category",
+    color_discrete_map={"Positive": "#1a9850", "Negative": "#d73027", "Sub-Industry": "#8856a7"},
     text=bar_df[rank_lookback_label].map(lambda x: f"{x:+.2f}%"),
     labels={rank_lookback_label: "Return (%)"},
 )
@@ -284,21 +330,26 @@ rs_days = min(rs_days, len(prices) - 1)
 rs_prices = prices.iloc[-(rs_days + 1):]
 rs_lines = compute_relative_strength(rs_prices, BENCHMARK)
 
+all_rs_options = list(available_sectors.keys()) + list(available_extras.keys())
+all_rs_labels = {**available_sectors, **available_extras}
+
 selected_sectors = st.multiselect(
     "Sectors to show",
-    options=list(available_sectors.keys()),
-    default=list(available_sectors.keys()),
-    format_func=lambda t: f"{t} — {available_sectors[t]}",
+    options=all_rs_options,
+    default=all_rs_options,
+    format_func=lambda t: f"{t} — {all_rs_labels[t]}",
 )
 
 fig_rs = go.Figure()
 for ticker in selected_sectors:
+    is_extra = ticker in available_extras
     fig_rs.add_trace(
         go.Scatter(
             x=rs_lines.index,
             y=rs_lines[ticker],
             mode="lines",
-            name=f"{ticker} ({available_sectors[ticker]})",
+            name=f"{ticker} ({all_rs_labels[ticker]})",
+            line=dict(dash="dash" if is_extra else "solid", width=3 if is_extra else 2),
         )
     )
 fig_rs.add_hline(y=100, line_dash="dash", line_color="gray", opacity=0.6)
@@ -329,8 +380,9 @@ rs_current = rs_full.iloc[-1]
 mom_current = momentum_score(quad_prices, quadrant_lookback)
 
 quad_df = pd.DataFrame({
-    "Ticker": list(available_sectors.keys()),
-    "Sector": [available_sectors[t] for t in available_sectors.keys()],
+    "Ticker": list(available_sectors.keys()) + list(available_extras.keys()),
+    "Sector": [available_sectors[t] for t in available_sectors.keys()] + [available_extras[t] for t in available_extras.keys()],
+    "Type": (["Sector"] * len(available_sectors)) + (["Sub-Industry"] * len(available_extras)),
 })
 quad_df["RS"] = quad_df["Ticker"].map(rs_current)
 quad_df["Momentum"] = quad_df["Ticker"].map(mom_current)
@@ -360,9 +412,11 @@ fig_quad = px.scatter(
     x="RS",
     y="Momentum",
     color="Quadrant",
+    symbol="Type",
+    symbol_map={"Sector": "circle", "Sub-Industry": "diamond"},
     color_discrete_map=quad_colors,
     text="Ticker",
-    hover_data={"Sector": True, "RS": ":.2f", "Momentum": ":.2f", "Quadrant": True},
+    hover_data={"Sector": True, "Type": True, "RS": ":.2f", "Momentum": ":.2f", "Quadrant": True},
 )
 fig_quad.update_traces(textposition="top center", marker=dict(size=14, line=dict(width=1, color="white")))
 fig_quad.add_vline(x=100, line_dash="dash", line_color="gray", opacity=0.5)
